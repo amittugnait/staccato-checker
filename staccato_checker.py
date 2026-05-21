@@ -20,22 +20,24 @@ from datetime import datetime, timezone
 PRODUCTS = [
     {
         "label": "Staccato HD C3.6",
-        "slug": "staccato-hd-c3-6-certified-pre-owned-handgun",
         "url": "https://staccato2011.com/products/staccato-hd-c3-6-certified-pre-owned-handgun",
     },
     {
         "label": "Staccato HD P4",
-        "slug": "staccato-hd-p4-certified-pre-owned-handgun",
         "url": "https://staccato2011.com/products/staccato-hd-p4-certified-pre-owned-handgun",
     },
     {
         "label": "Staccato HD C4X",
-        "slug": "staccato-hd-c4x-certified-pre-owned-handgun",
         "url": "https://staccato2011.com/products/staccato-hd-c4x-certified-pre-owned-handgun",
+        "fallback_url": "https://staccato2011.com/products/staccato-hd-c4x-state-compliant",
     },
 ]
 
 COMPLIANT_KEYWORDS = ["compliant preferred", "state compliant preferred"]
+
+# Condition grades Staccato uses — any of these appearing WITHOUT "(Out of stock)"
+# means that condition is available to purchase
+CONDITION_GRADES = ["like new", "very good", "average", "factory blem"]
 
 
 def fetch_html(url):
@@ -51,7 +53,6 @@ def fetch_html(url):
 
 
 def extract_next_data(html):
-    """Extract the __NEXT_DATA__ JSON blob that Next.js embeds in the page."""
     match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
     if not match:
         return None
@@ -61,41 +62,31 @@ def extract_next_data(html):
         return None
 
 
-def find_available_compliant_variants(next_data, product):
+def find_available_compliant_variants_next(next_data, product):
+    """Parse availability from Next.js embedded JSON."""
     found = []
-
     try:
-        # Walk the Next.js data tree to find product/variant info
         props = next_data.get("props", {})
         page_props = props.get("pageProps", {})
-
-        # Try common locations for product data in BigCommerce/Next.js sites
         product_data = (
             page_props.get("product") or
             page_props.get("data", {}).get("product") or
-            page_props.get("productData") or
-            {}
+            page_props.get("productData") or {}
         )
-
         variants = product_data.get("variants", [])
-
         if not variants:
-            # Sometimes nested under .node or .edges
             edges = product_data.get("variants", {}).get("edges", [])
             variants = [e.get("node", {}) for e in edges]
-
     except Exception as e:
         print(f"    Could not parse variant data: {e}")
         return found
 
     if not variants:
-        print(f"    No variants found in page data for {product['label']}")
+        print(f"    No variants found in Next.js data")
         return found
 
     for v in variants:
         option_values = v.get("option_values", []) or v.get("optionValues", [])
-
-        # Handle both flat list and edges/node format
         if option_values and isinstance(option_values[0], dict) and "node" in option_values[0]:
             option_values = [e["node"] for e in option_values]
 
@@ -107,7 +98,6 @@ def find_available_compliant_variants(next_data, product):
         if not any(kw in all_labels for kw in COMPLIANT_KEYWORDS):
             continue
 
-        # Stock check
         purchasing_disabled = v.get("purchasing_disabled") or v.get("purchasingDisabled") or False
         inventory_level = v.get("inventory_level") or v.get("inventoryLevel") or 0
         inventory_tracking = v.get("inventory_tracking") or v.get("inventoryTracking") or "none"
@@ -125,23 +115,16 @@ def find_available_compliant_variants(next_data, product):
             continue
 
         config_label = next(
-            (
-                (o.get("label") or o.get("value") or "")
-                for o in option_values
-                if "config" in (o.get("option_display_name") or o.get("optionDisplayName") or "").lower()
-                or "package" in (o.get("option_display_name") or o.get("optionDisplayName") or "").lower()
-            ),
+            ((o.get("label") or o.get("value") or "") for o in option_values
+             if "config" in (o.get("option_display_name") or o.get("optionDisplayName") or "").lower()
+             or "package" in (o.get("option_display_name") or o.get("optionDisplayName") or "").lower()),
             all_labels
         )
         condition_label = next(
-            (
-                (o.get("label") or o.get("value") or "")
-                for o in option_values
-                if "condition" in (o.get("option_display_name") or o.get("optionDisplayName") or "").lower()
-            ),
+            ((o.get("label") or o.get("value") or "") for o in option_values
+             if "condition" in (o.get("option_display_name") or o.get("optionDisplayName") or "").lower()),
             ""
         )
-
         found.append({
             "label": product["label"],
             "config": config_label,
@@ -155,34 +138,85 @@ def find_available_compliant_variants(next_data, product):
 
 def check_html_fallback(html, product):
     """
-    Fallback: if Next.js data parsing fails, scan raw HTML for
-    compliant keywords NOT followed by 'out of stock' / 'sold out'.
-    Returns a simple result dict if something looks available.
+    Reliable HTML fallback using two signals that must BOTH be true:
+    1. A compliant keyword exists on the page (the config is listed)
+    2. At least one condition grade appears WITHOUT '(out of stock)' after it
+       — meaning some condition is purchasable
+
+    This correctly handles the case where the non-compliant config is available
+    but the compliant one is sold out, because Staccato's conditions are shared
+    across all configurations — if any condition is available, the compliant
+    config can also be selected with that condition.
     """
     lower = html.lower()
-    for kw in COMPLIANT_KEYWORDS:
-        idx = lower.find(kw)
+
+    # Signal 1: compliant config is listed on the page
+    has_compliant = any(kw in lower for kw in COMPLIANT_KEYWORDS)
+    if not has_compliant:
+        print(f"    No compliant configuration found on page")
+        return []
+
+    # Signal 2: find a condition grade that is NOT followed by "(out of stock)"
+    available_conditions = []
+    for grade in CONDITION_GRADES:
+        idx = lower.find(grade)
         if idx == -1:
             continue
-        # Look at surrounding 300 chars for sold-out signals
-        context = lower[max(0, idx-200):idx+300]
-        if "sold out" in context or "out of stock" in context:
-            print(f"    ❌ '{kw}' found in HTML but appears sold out")
-            continue
+        # Look at the 60 chars after the grade name
+        after = lower[idx:idx + 60]
+        if "out of stock" not in after:
+            available_conditions.append(grade.title())
 
-        # Extract a rough price from nearby text
-        price_match = re.search(r'\$[\d,]+\.?\d*', html[max(0, idx-300):idx+300])
-        price_str = price_match.group(0) if price_match else "See site"
+    if not available_conditions:
+        print(f"    ❌ Compliant config listed but all conditions show (Out of stock)")
+        return []
 
-        print(f"    ✅ '{kw}' found in HTML and does NOT appear sold out!")
-        return [{
-            "label": product["label"],
-            "config": kw.title(),
-            "condition": "",
-            "price": price_str,
-            "url": product["url"],
-        }]
+    # Both signals present — something is available!
+    price_match = re.search(r'\$[\d,]+\.?\d*', html)
+    price_str = price_match.group(0) if price_match else "See site"
 
+    conditions_str = ", ".join(available_conditions)
+    print(f"    ✅ Compliant config available! Conditions in stock: {conditions_str}")
+
+    return [{
+        "label": product["label"],
+        "config": "State Compliant Preferred Package",
+        "condition": conditions_str,
+        "price": price_str,
+        "url": product["url"],
+    }]
+
+
+def check_product(product):
+    urls_to_try = [product["url"]]
+    if product.get("fallback_url"):
+        urls_to_try.append(product["fallback_url"])
+
+    for url in urls_to_try:
+        try:
+            print(f"    Fetching {url}")
+            html = fetch_html(url)
+
+            next_data = extract_next_data(html)
+            if next_data:
+                print(f"    Found Next.js page data, parsing variants...")
+                return find_available_compliant_variants_next(next_data, product)
+            else:
+                print(f"    No Next.js data found, using HTML fallback...")
+                return check_html_fallback(html, product)
+
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                print(f"    404 at {url}" + (", trying fallback..." if product.get("fallback_url") and url == product["url"] else ""))
+                continue
+            else:
+                print(f"    ⚠️  HTTP error {e.code}")
+                return []
+        except Exception as e:
+            print(f"    ⚠️  Error: {e}")
+            return []
+
+    print(f"    ⚠️  All URLs returned 404 — CPO page may not exist yet for this model")
     return []
 
 
@@ -247,33 +281,20 @@ def send_email(available):
 
 def main():
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    print(f"[{now}] Checking Staccato CA compliant CPO stock...")
+    print(f"[{now}] Checking Staccato CA compliant CPO stock...\n")
 
     all_available = []
 
     for product in PRODUCTS:
-        print(f"\n  Checking {product['label']}...")
-        try:
-            html = fetch_html(product["url"])
+        print(f"  Checking {product['label']}...")
+        available = check_product(product)
+        if available:
+            print(f"  ✅ {len(available)} compliant variant(s) IN STOCK!")
+            all_available.extend(available)
+        else:
+            print(f"  ⚪ Nothing available")
+        print()
 
-            next_data = extract_next_data(html)
-            if next_data:
-                print(f"    Found Next.js page data, parsing variants...")
-                available = find_available_compliant_variants(next_data, product)
-            else:
-                print(f"    No Next.js data found, using HTML fallback...")
-                available = check_html_fallback(html, product)
-
-            if available:
-                print(f"    ✅ {len(available)} compliant variant(s) IN STOCK!")
-                all_available.extend(available)
-            else:
-                print(f"    ⚪ No available compliant variants found")
-
-        except Exception as e:
-            print(f"    ⚠️  Error: {e}")
-
-    print()
     if all_available:
         print(f"Found {len(all_available)} available item(s) — sending email...")
         try:
