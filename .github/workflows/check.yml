@@ -1,0 +1,23 @@
+name: Staccato Stock Check
+
+on:
+  schedule:
+    - cron: '45 13 * * 3'
+    - cron: '0 14 * * 3'
+    - cron: '15 14 * * 3'
+    - cron: '30 14 * * 3'
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Run checker
+        env:
+          GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python staccato_checker.py
